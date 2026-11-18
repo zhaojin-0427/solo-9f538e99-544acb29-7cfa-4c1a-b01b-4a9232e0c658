@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import httpx
 
 from . import db as dbmod
+from . import quality
 
 SOURCE_BASE_URL = os.environ.get("SOURCE_BASE_URL", "http://localhost:8001")
 PAGE_TIMEOUT = float(os.environ.get("PAGE_TIMEOUT_SECONDS", "3"))
@@ -213,7 +214,8 @@ def _collect(hour: str) -> dict:
                     try:
                         total, items = _fetch_version(client, version)
                         new_snap = _apply(base, items)
-                        # 3) 数据与当前版指针在同一事务生效
+                        # 3) 数据、当前版指针与质量标记在同一事务生效:
+                        #    任一环节失败整体回滚,读数与标记永不错配。
                         with dbmod.tx(db):
                             db.execute(
                                 "INSERT INTO versions(hour, version, total_pages, item_count, "
@@ -229,6 +231,10 @@ def _collect(hour: str) -> dict:
                                 "UPDATE hours SET current_version=?, updated_at=? WHERE hour=?",
                                 (version, _now(), hour),
                             )
+                            # 质量标记随确认版写入:对受影响站点全历史重算,
+                            # 修订后邻近小时同步改判,平线段跨越窗口边缘也能正确计算。
+                            for sid in quality.affected_station_ids(db, hour, version):
+                                quality.recompute_station_quality(db, sid)
                         confirmed = version
                         attempts[version] = attempt
                         ok = True

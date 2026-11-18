@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
 from . import db as dbmod
+from . import quality
 from . import service
 
 HOUR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}$")
@@ -143,5 +144,37 @@ def hour_data(
             "station_count": len(rows),
             "stations": [{"station_id": r["station_id"], "pm25": r["pm25"]} for r in rows],
         }
+    finally:
+        db.close()
+
+
+@app.get("/stations/{station_id}/quality")
+def station_quality(
+    station_id: str,
+    start: str = Query(..., description="起始 UTC 小时,形如 2026-11-18T10(含)"),
+    end: str = Query(..., description="结束 UTC 小时,形如 2026-11-18T12(含),跨度最多 48 小时"),
+):
+    """站点质量序列:逐小时返回确认版、读数与质量状态。
+
+    - 连续至少 6 个整点同值的整段标为 `flatline`,质量供数 `quality_pm25` 置空;
+    - 缺采集的小时为 `missing`,站点被删的小时为 `deleted`,二者都会截断平线连续性;
+    - 原始读数仍可通过 `/hours/{hour}/data` 按版查询,本接口不改动历史版数据。
+    """
+    start = _check_hour(start)
+    end = _check_hour(end)
+    start_dt = datetime.strptime(start, "%Y-%m-%dT%H")
+    end_dt = datetime.strptime(end, "%Y-%m-%dT%H")
+    if end_dt < start_dt:
+        raise HTTPException(400, "end must be the same as or later than start")
+    span = int((end_dt - start_dt).total_seconds() // 3600) + 1
+    if span > quality.MAX_SERIES_HOURS:
+        raise HTTPException(
+            400, f"range covers {span} hours, at most {quality.MAX_SERIES_HOURS} consecutive hours"
+        )
+    db = dbmod.connect()
+    try:
+        return quality.quality_series(db, station_id, start, end)
+    except quality.StationNotFound:
+        raise HTTPException(404, f"station {station_id} has no confirmed reading")
     finally:
         db.close()

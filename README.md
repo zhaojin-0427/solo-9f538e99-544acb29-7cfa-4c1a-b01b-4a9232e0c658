@@ -6,7 +6,8 @@
   新增、改值(`upsert`)和删除(`delete`),响应带连续版号 `version`、页号 `page`、
   总页数 `total_pages`。管理接口可发布/切换修订、注入缺页、超时、同版同站冲突故障。
 - **collector**(采集与查询 API,FastAPI + SQLite):采集某 UTC 小时前先固定源站当前版,
-  再逐版补齐;每个确认版的完整快照均可查询;数据与当前版指针在同一事务生效。
+  再逐版补齐;每个确认版的完整快照均可查询;数据、当前版指针与质量标记在同一事务生效。
+  另提供站点质量序列 API:识别设备卡死产生的连续同值"平线",在质量供数中置空剔除。
 
 ## 快速开始
 
@@ -17,10 +18,12 @@ docker compose up --build
 - 采集/查询 API: http://localhost:8000 (文档 `/docs`)
 - 模拟源站: http://localhost:8001 (文档 `/docs`)
 
-端到端冒烟(35+ 项断言,覆盖缺页/超时/冲突/回退):
+端到端冒烟(覆盖缺页/超时/冲突/回退,以及平线剔除/修订连坐/迁移回填/并发一致性):
 
 ```bash
-python3 scripts/smoke.py
+python3 scripts/smoke.py            # 采集与按版查询:30 项断言
+python3 scripts/quality_smoke.py    # 站点质量序列:63 项断言
+python3 scripts/backfill_test.py    # 既有确认数据迁移回填(无需起服务)
 ```
 
 ## 典型流程
@@ -42,7 +45,32 @@ curl localhost:8000/hours/2026-11-18T10/data
 curl 'localhost:8000/hours/2026-11-18T10/data?version=1'
 curl 'localhost:8000/hours/2026-11-18T10/data?version=3&station_id=S07'
 curl localhost:8000/hours/2026-11-18T10/versions
+
+# 5. 站点质量序列(最多 48 个连续 UTC 小时);平线段质量供数置空,原始读数仍可按版查询
+curl 'localhost:8000/stations/S07/quality?start=2026-11-18T00&end=2026-11-18T23'
 ```
+
+## 站点质量序列与平线剔除
+
+设备卡死时会连续报出同一 PM2.5 值。质量接口按站点返回逐小时的确认版 `version`、
+原始读数 `pm25`、质量供数 `quality_pm25` 与状态 `status`:
+
+| status | 含义 | quality_pm25 |
+| --- | --- | --- |
+| `ok` | 有读数,不属于平线 | 同 `pm25` |
+| `flatline` | 连续至少 6 个整点读数完全相同的整段 | 置空 `null`(下游剔除) |
+| `missing` | 该 UTC 小时从未成功采集 | `null` |
+| `deleted` | 该小时已采集,但站点在当前供数版中被删除 | `null` |
+
+判定要点:
+
+- **缺小时与删站截断连续性**:`missing`/`deleted` 处平线段断开,前后不连坐。
+- **修订连坐**:某小时改值后,对受影响站点做全历史重算,邻近小时同步改判;
+  判定基于全库连续读数,因此查询窗口边缘之外的同值小时也计入平线长度。
+- **按版查询不受影响**:`/hours/{hour}/data?version=N` 始终返回该确认版原始值,
+  置空只发生在质量接口的 `quality_pm25`,不物化改写任何历史读数。
+- **随确认版写入且既有数据回填**:质量标记与读数、当前版指针在同一事务提交;
+  升级前已确认的数据在启动时自动回填(单次迁移,`PRAGMA user_version` 防重)。
 
 ## 故障注入演示(缺页 / 超时 / 同版同站冲突)
 
@@ -66,7 +94,12 @@ curl -X DELETE localhost:8001/admin/faults   # 清除全部故障
 | 缺页/超时/同版同站冲突时保留原供数版 | 错误只更新 `hours.status/last_error`,`current_version` 指针不动;失败版及后续版不确认 |
 | 重试不能混入残页 | 页面只存内存、从不落库;每次重试从第 1 页整版重取(`_fetch_version`) |
 | 已确认版均可查当时完整数据 | 每版确认时物化全量快照到 `entries`,`GET /hours/{hour}/data?version=N` |
-| 数据与当前版指针一同生效 | 单事务写入 `versions` + `entries` + `hours.current_version`(`db.py::tx`) |
+| 数据与当前版指针一同生效 | 单事务写入 `versions` + `entries` + `hours.current_version` + `quality_marks`(`db.py::tx`) |
+| 连续 ≥6 整点同值标平线并置空 | `quality.py::classify` 分段判定,`flatline` 段 `quality_pm25=NULL`,原始 `pm25` 保留 |
+| 缺小时/删站截断平线 | 未采集小时不入选中序列;删除站无标记,查询派生 `missing`/`deleted` 并断开连续段 |
+| 修订一小时、邻近小时同步改判 | 确认新版时对新旧快照并集站点 `recompute_station_quality` 全历史重算;全库读数参与,边缘正确 |
+| 质量标记随确认版写入且存量纳入 | 标记在确认事务内重算写入;`db.init()` 经 `user_version` 迁移回填既有确认数据 |
+| 读数与标记不出现不一致 | 同事务原子提交 + 查询走只读快照事务 `read_tx`;标记冗余 `version/pm25` 并在查询时自检 |
 | 失败或重启不得暴露半版 | 事务原子提交;启动时仅复位 `collecting` 状态元信息;SQLite WAL + 数据卷持久化 |
 
 ## API 一览
@@ -80,6 +113,7 @@ curl -X DELETE localhost:8001/admin/faults   # 清除全部故障
 | GET | `/hours` | 全部小时及当前版指针 |
 | GET | `/hours/{hour}/versions` | 已确认版列表 |
 | GET | `/hours/{hour}/data` | 某版完整数据;`version` 缺省取当前版,`station_id` 可单站过滤 |
+| GET | `/stations/{station_id}/quality` | 站点质量序列;`start`/`end` 为 UTC 小时闭区间,跨度最多 48 小时,逐小时返回确认版/读数/状态 |
 
 **source(8001)**
 
